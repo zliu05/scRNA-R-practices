@@ -1,0 +1,225 @@
+---
+title: "scSLIDE tutorial, Part 1: sample-level analysis of COVID-19 scRNA-seq"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  data_file: "Raw_count_Subset_104k_Ahern_2022_Cell.rds"
+  use_wrapper: false
+---
+
+Follows Part 1 of the Seurat scSLIDE vignette
+(<https://satijalab.org/seurat/articles/scslide_vignette>) on a ~104k-cell subset of
+Ahern et al. 2022 (40 donors: HV, MILD, SEV, CRIT).
+
+Download the `.rds` file from the vignette's Dropbox link, put it next to this notebook,
+and knit with `rmarkdown::render("scslide_part1.Rmd")`.
+
+> **Status:** these chunks have not been run yet. Expect small fixes (argument names,
+> metadata columns such as `Age` and `Sex`, the effect-size column in `TrajDETest` output).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 7, fig.height = 5)
+
+cran_pkgs <- c("Seurat", "princurve", "ggplot2", "ggridges", "remotes", "BiocManager")
+for (p in cran_pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+if (!requireNamespace("destiny", quietly = TRUE)) BiocManager::install("destiny")
+if (!requireNamespace("BPCells", quietly = TRUE)) remotes::install_github("bnprks/BPCells/r")
+if (!requireNamespace("AzimuthAPI", quietly = TRUE)) remotes::install_github("satijalab/AzimuthAPI")
+
+library(Seurat); library(BPCells); library(princurve); library(ggplot2); library(ggridges)
+
+donor_col <- "Donor"; disease_col <- "Disease"; time_col <- "TimeSinceOnset"
+celltype_col <- "azimuth_label"
+out_dir <- "output"; dir.create(out_dir, showWarnings = FALSE)
+```
+
+## 1. Load, normalize, annotate
+
+```{r load}
+object <- readRDS(params$data_file)
+stopifnot(all(c(donor_col, disease_col) %in% colnames(object[[]])))
+object <- NormalizeData(object)
+```
+
+Pan-human Azimuth annotation through the cloud API (needs internet). This adds the
+`azimuth_label` cell types and the `azimuth_embed` reduction.
+
+```{r azimuth}
+object <- CloudAzimuth(object)
+stopifnot(celltype_col %in% colnames(object[[]]), "azimuth_embed" %in% Reductions(object))
+object <- FindVariableFeatures(object, nfeatures = 2000)
+
+table(object[[disease_col]][, 1], useNA = "ifany")
+length(unique(object[[donor_col]][, 1]))
+```
+
+## 2. Prepare the sample-level object
+
+Landmark cells, a disease-oriented (PLS) embedding, and a WNN graph linking every cell to
+landmarks. Set `use_wrapper: true` in the header to use the one-call wrapper instead.
+
+```{r wrapper, eval=params$use_wrapper}
+object <- PrepareSampleObject(
+  object = object, assay = "RNA", add.hvg = TRUE,
+  group.by.CorTest = celltype_col, Y = disease_col,
+  sketch.training = TRUE, group.by.Sketch = donor_col,
+  ncells.per.group = 1000, ncells.landmark = 2000, ncomp = 20,
+  pls.function = "cppls", k.nn = 5,
+  name.reduction.1 = "azimuth_embed", dims.reduction.1 = 1:128,
+  fix.wnn.weights = c(0.5, 0.5), verbose = TRUE
+)
+```
+
+### 2a. Sketching
+
+```{r sketch, eval=!params$use_wrapper}
+# Uniform: 1,000 cells per donor, to balance donors for PLS training
+object <- SketchDataByGroup(object, assay = "RNA", ncells = 1000,
+  sketched.assay = "TRAINING", method = "Uniform", group.by = donor_col, verbose = FALSE)
+
+# Leverage score: 2,000 diverse landmark cells
+object <- SketchData(object, assay = "TRAINING", ncells = 2000,
+  sketched.assay = "LANDMARK", method = "LeverageScore", verbose = FALSE)
+```
+
+### 2b. Disease-relevant genes and PLS
+
+```{r pls, eval=!params$use_wrapper}
+deg_list <- QuickCorTest(object, assay = "TRAINING", layer = "data",
+  group.by = celltype_col, Y = disease_col, cor.cutoff = 0.2, verbose = FALSE)
+all_HVG <- union(VariableFeatures(object), deg_list)
+length(all_HVG)
+
+DefaultAssay(object) <- "TRAINING"
+object <- ScaleData(object, features = all_HVG)
+object <- RunPLS(object = object, assay = "TRAINING", features = all_HVG,
+  ncomp = 20, Y = c(disease_col), pls.function = "cppls", verbose = FALSE)
+```
+
+### 2c. Project PLS onto all cells and build the WNN graph
+
+```{r wnn, eval=!params$use_wrapper}
+proj.pls <- ProjectCellEmbeddings(query = object, query.assay = "RNA",
+  reference = object, reference.assay = "TRAINING", reduction = "pls",
+  dims = 1:20, scale = TRUE, normalization.method = "LogNormalize", verbose = TRUE)
+object[["proj.pls"]] <- CreateDimReducObject(embeddings = proj.pls, key = "pPLS_", assay = "RNA")
+rm(proj.pls); invisible(gc())
+
+DefaultAssay(object) <- "RNA"
+object <- FindmmNN(object, sketch.assay = "LANDMARK",
+  reduction.list = list("azimuth_embed", "proj.pls"), k.nn = 5,
+  nn.name = "weighted.nn", dims.list = list(1:128, 1:20), fix.wnn.weights = c(0.5, 0.5))
+
+# Optional single-modality graph (PLS only)
+object <- FindsmNN(object, sketch.assay = "LANDMARK", reduction = "proj.pls",
+  k.nn = 5, dims = 1:20, nn.name = "single.nn")
+```
+
+## 3. Sample-level embedding and diffusion map
+
+```{r sample}
+sample_obj <- GenerateSampleObject(object = object, sketch.assay = "LANDMARK",
+  nn.name = "weighted.nn", group.by = donor_col, rename.group.by = celltype_col,
+  k.nn = 5, normalization.method = "ChiSquared", add.meta.data = TRUE, return.seurat = TRUE)
+sample_obj <- ScaleData(sample_obj, features = rownames(sample_obj),
+  do.scale = FALSE, do.center = TRUE)
+
+sample_obj <- RunDiffusionMap(sample_obj, assay = "LMC", layer = "scale.data",
+  features = rownames(sample_obj), ncomp = 10)
+
+dc <- Embeddings(sample_obj, "DiffMap")[, 1:3]
+sample_obj$DC1 <- dc[, 1]; sample_obj$DC2 <- dc[, 2]; sample_obj$DC3 <- dc[, 3]
+```
+
+```{r diffmap-plots}
+DimPlot(sample_obj, reduction = "DiffMap", dims = c(1, 2), group.by = disease_col)
+DimPlot(sample_obj, reduction = "DiffMap", dims = c(1, 3), group.by = disease_col)
+```
+
+```{r dc-time, eval=FALSE}
+# Off by default: set eval=TRUE if the sample metadata has a time-since-onset column
+df <- sample_obj[[]]
+ggplot(df, aes(x = .data[[time_col]], y = DC3, color = .data[[disease_col]])) +
+  geom_point() + theme_classic()
+```
+
+## 4. Joint pseudo-trajectory (principal curve)
+
+```{r princurve}
+princurve_res <- princurve::principal_curve(
+  Embeddings(sample_obj, "DiffMap")[, 1:2], plot = FALSE, maxit = 20, trace = TRUE)
+sample_obj$traj_overall <- as.numeric(princurve_res$lambda)
+```
+
+## 5. Differential expression along each DC (CD14 monocytes)
+
+```{r pseudobulk}
+bulk_obj <- AggregateExpression(object, assays = "RNA",
+  group.by = c(donor_col, celltype_col), return.seurat = TRUE)
+sub_bulk_obj <- subset(bulk_obj, subset = azimuth_label == "CD14 monocyte")
+
+# Merge sample-level covariates; AggregateExpression can rewrite "_" as "-"
+norm_id <- function(x) gsub("_", "-", as.character(x))
+sample_meta <- sample_obj[[]]
+idx <- match(norm_id(sub_bulk_obj[[]][[donor_col]]), norm_id(rownames(sample_meta)))
+stopifnot(!anyNA(idx))
+
+for (v in c("Age", "Sex", disease_col)) {
+  if (v %in% colnames(sample_meta)) sub_bulk_obj[[v]] <- sample_meta[[v]][idx]
+}
+sub_bulk_obj$traj_DC1 <- sample_meta$DC1[idx]
+sub_bulk_obj$traj_DC2 <- sample_meta$DC2[idx]
+sub_bulk_obj$traj_DC3 <- sample_meta$DC3[idx]
+sub_bulk_obj$log_count <- log(Matrix::colSums(
+  LayerData(sub_bulk_obj, assay = "RNA", layer = "counts")))
+```
+
+DC2 and DC3 are fit on patients only (healthy donors removed).
+
+```{r de}
+non_health_idx <- which(sub_bulk_obj[[disease_col]][, 1] != "HV")
+lv <- c("Age", "Sex", "log_count")
+
+de_dc1 <- TrajDETest(sub_bulk_obj, assay = "RNA", layer = "counts",
+  traj.var = "traj_DC1", latent.vars = lv)
+de_dc2 <- TrajDETest(sub_bulk_obj, assay = "RNA", layer = "counts",
+  traj.var = "traj_DC2", latent.vars = lv, samples = non_health_idx)
+de_dc3 <- TrajDETest(sub_bulk_obj, assay = "RNA", layer = "counts",
+  traj.var = "traj_DC3", latent.vars = lv, samples = non_health_idx)
+
+# Top 20 up and 20 down genes. The effect-size column is found by pattern;
+# check names(de_dc1) if this fails.
+top_genes <- function(res, n = 20) {
+  res <- as.data.frame(res)
+  eff <- grep("coef|logfc|log2fc|estimate|beta", colnames(res),
+              ignore.case = TRUE, value = TRUE)[1]
+  stopifnot(!is.na(eff))
+  ord <- res[order(res[[eff]], decreasing = TRUE), , drop = FALSE]
+  unique(c(head(rownames(ord), n), tail(rownames(ord), n)))
+}
+DEG_DC1 <- top_genes(de_dc1); DEG_DC2 <- top_genes(de_dc2); DEG_DC3 <- top_genes(de_dc3)
+```
+
+### Heatmaps ordered by each DC
+
+```{r heatmaps, fig.height=7}
+sub_bulk_obj2 <- subset(sub_bulk_obj, cells = colnames(sub_bulk_obj)[non_health_idx])
+cols_all <- c("#f8766d", "cornsilk", "#7cae02", "blue1", "#01bfc4", "#c77cff")
+
+draw <- function(obj, feats, dc, cols) {
+  obj <- ScaleData(obj, features = feats)
+  PlotAnnotatedHeatmap(object = obj, features = feats, sort.by = dc,
+    anno.var = disease_col, anno.colors = list(cols),
+    hm.colors = c("blue", "white", "red"))
+}
+draw(sub_bulk_obj,  DEG_DC1, "traj_DC1", cols_all)
+draw(sub_bulk_obj2, DEG_DC2, "traj_DC2", cols_all[-1])
+draw(sub_bulk_obj2, DEG_DC3, "traj_DC3", cols_all[-1])
+```
+
+```{r session}
+sessionInfo()
+```

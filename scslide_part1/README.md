@@ -18,6 +18,12 @@ Run from this folder, in R, in order:
 
 Intermediate objects and figures go to `output/`.
 
+## Notebook
+
+`scslide_part1.Rmd` contains the same analysis as one R Markdown notebook. Knit it with
+`rmarkdown::render("scslide_part1.Rmd")` to get the HTML report. No HTML is included yet
+because the notebook hasn't been run.
+
 ## Data
 
 Download `Raw_count_Subset_104k_Ahern_2022_Cell.rds` from the Dropbox link in the
